@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import dbConnect from '@/lib/mongodb';
 import User from '@/models/User';
 import nodemailer from 'nodemailer';
-import { ratelimit } from '@/lib/ratelimit'; // Rate limiter import kiya
+import { ratelimit } from '@/lib/ratelimit';
 
 export async function POST(req: Request) {
   try {
@@ -12,17 +12,17 @@ export async function POST(req: Request) {
 
     if (!success) {
       return NextResponse.json(
-        { 
-          success: false, 
-          error: "Bohat ziyaada requests aa gayi hain. Baraye meharbaani kuch der baad koshish karein." 
-        }, 
-        { 
+        {
+          success: false,
+          error: "Bohat ziyaada requests aa gayi hain. Baraye meharbaani kuch der baad koshish karein.",
+        },
+        {
           status: 429,
           headers: {
             "X-RateLimit-Limit": limit.toString(),
             "X-RateLimit-Remaining": remaining.toString(),
             "X-RateLimit-Reset": reset.toString(),
-          }
+          },
         }
       );
     }
@@ -30,17 +30,31 @@ export async function POST(req: Request) {
     await dbConnect();
     const { email } = await req.json();
 
-    const user = await User.findOne({ email });
+    if (!email) {
+      return NextResponse.json({ error: "Email is required!" }, { status: 400 });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await User.findOne({ email: normalizedEmail });
+
     if (!user) {
       return NextResponse.json({ error: "User not found!" }, { status: 400 });
     }
 
-    // Naya 6-digit OTP generate karein
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes expiry
+    // Agar user sirf Google login se registered hai aur uska password set nahi hai
+    if (!user.password) {
+      return NextResponse.json(
+        { error: "This account uses Google Sign-In. Please continue with Google." },
+        { status: 400 }
+      );
+    }
 
-    user.otp = otp;
-    user.otpExpires = otpExpires;
+    // Naya 6-digit password reset OTP generate karein (10 minutes expiry)
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+
+    user.resetPasswordOtp = otp;
+    user.resetPasswordOtpExpires = otpExpires;
     await user.save();
 
     // Nodemailer transporter setup
@@ -52,15 +66,25 @@ export async function POST(req: Request) {
       },
     });
 
-    // Email bhejna
+    // Password reset OTP email bhejna
     await transporter.sendMail({
       from: process.env.NEXT_PUBLIC_ADMIN_EMAIL,
-      to: email,
-      subject: 'Resend: Verify your E-Commerce Account OTP',
-      html: `<h2>Your New OTP Code is: <b>${otp}</b></h2><p>Valid for 10 minutes.</p>`,
+      to: normalizedEmail,
+      subject: 'Reset Your E-Commerce Account Password (OTP)',
+      html: `
+        <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+          <h2>Password Reset Request</h2>
+          <p>Apna naya password set karne ke liye yeh 6-digit OTP code use karein:</p>
+          <p style="font-size: 24px; font-weight: bold; letter-spacing: 4px;">${otp}</p>
+          <p>Yeh OTP <strong>10 minutes</strong> tak valid hai. Agar aapne request nahi ki toh is email ko ignore kar dein.</p>
+        </div>
+      `,
     });
 
-    return NextResponse.json({ message: "OTP resent successfully!" }, { status: 200 });
+    return NextResponse.json(
+      { message: "Password reset OTP sent to your email!" },
+      { status: 200 }
+    );
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
