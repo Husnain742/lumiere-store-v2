@@ -33,7 +33,7 @@ export default function MyOrdersPage() {
 
   const fetchUserOrders = async () => {
     try {
-      const res = await axios.get(`/api/orders?email=${session?.user?.email}`);
+      const res = await axios.get("/api/orders", { params: { t: Date.now() } });
       setOrders(res.data.orders || []);
     } catch (err) {
       console.error("Failed to fetch user orders:", err);
@@ -68,14 +68,13 @@ export default function MyOrdersPage() {
         setOrders((prevOrders) =>
           prevOrders.map((ord) => (ord._id === orderId ? { ...ord, status: "Cancelled" } : ord))
         );
-        router.refresh();
         fetchUserOrders();
       } else {
         toast.error("Order cancel karne mein nakami hui.");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to cancel order:", err);
-      toast.error("Server error ki wajah se order cancel nahi ho saka.");
+      toast.error(err?.response?.data?.error || "Server error ki wajah se order cancel nahi ho saka.");
     } finally {
       setCancellingId(null);
     }

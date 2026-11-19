@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import mongoose from "mongoose";
 import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
 import { redis } from "@/lib/redis";
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -57,7 +58,7 @@ export async function GET() {
 // POST: Admin ke liye announcement update karne ke liye (With Cache Invalidation)
 export async function POST(req: Request) {
   try {
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || session.user?.email !== ADMIN_EMAIL) {
       return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
     }

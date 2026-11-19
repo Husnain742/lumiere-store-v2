@@ -34,41 +34,74 @@ function ProductDetailContent() {
   // Timer active check for sale expiration
   const [isSaleActive, setIsSaleActive] = useState(true);
 
-  useEffect(() => {
-    if (id) {
-      fetchProductDetails();
-    }
-  }, [id]);
-
-  const fetchProductDetails = async () => {
+  // Single product DB se FRESH lo (Redis cache bypass) taake order ke baad stock foran sahi dikhe.
+  // `silent` = true par spinner nahi dikhta aur user ka selected size/image reset nahi hota.
+  const fetchProductDetails = async (silent = false) => {
     try {
-      const res = await axios.get(`/api/products`);
-      const productsList = res.data.products || [];
-      setAllProducts(productsList);
+      if (!silent) setLoading(true);
+      const res = await axios.get(`/api/products/${id}`, { params: { fresh: 1, t: Date.now() } });
+      const found = res.data.product;
+      if (!found) {
+        setProduct(null);
+        return;
+      }
+      setProduct(found);
 
-      const found = productsList.find((p: any) => p._id === id);
-      if (found) {
-        setProduct(found);
-        const initialImg = (found.images && found.images.length > 0) ? found.images[0] : found.image;
-        setActiveImage(initialImg || null);
+      const initialImg = found.images && found.images.length > 0 ? found.images[0] : found.image;
+      setActiveImage((prev) => prev ?? initialImg ?? null);
 
-        if (found.sizes && found.sizes.length > 0) {
-          setSelectedSize(found.sizes[0]);
-        } else {
-          setSelectedSize("Standard");
-        }
+      setSelectedSize((prev) => {
+        const sizes: string[] = found.sizes || [];
+        if (prev && (sizes.includes(prev) || (sizes.length === 0 && prev === "Standard"))) return prev;
+        return sizes.length > 0 ? sizes[0] : "Standard";
+      });
 
+      if (!silent) {
         const existingViews = JSON.parse(localStorage.getItem("recentlyViewed") || "[]");
         const updatedViews = [found._id, ...existingViews.filter((itemId: string) => itemId !== found._id)].slice(0, 4);
         localStorage.setItem("recentlyViewed", JSON.stringify(updatedViews));
       }
-    } catch (err) {
-      console.error("Failed to fetch product details:", err);
-      toast.error("Product details load karne mein masla hua!");
+    } catch (err: any) {
+      if (err?.response?.status === 404) {
+        setProduct(null);
+      } else {
+        console.error("Failed to fetch product details:", err);
+        if (!silent) toast.error("Product details load karne mein masla hua!");
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  // "Recently viewed" ke liye list (cache se theek hai, sirf title/price/image chahiye)
+  const fetchAllProducts = async () => {
+    try {
+      const res = await axios.get("/api/products");
+      setAllProducts(res.data.products || []);
+    } catch (err) {
+      console.error("Failed to fetch products list:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!id) return;
+    setActiveImage(null);
+    setSelectedSize("");
+    fetchProductDetails();
+    fetchAllProducts();
+
+    // Tab par wapas aane par (e.g. checkout/orders ke baad) stock dobara sync karo
+    const resync = () => {
+      if (document.visibilityState === "visible") fetchProductDetails(true);
+    };
+    window.addEventListener("focus", resync);
+    document.addEventListener("visibilitychange", resync);
+    return () => {
+      window.removeEventListener("focus", resync);
+      document.removeEventListener("visibilitychange", resync);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
 
   useEffect(() => {
     if (!product?.saleEndDate) return;
@@ -99,7 +132,7 @@ function ProductDetailContent() {
 
   const recentlyViewedList = getRecentlyViewedProducts();
 
-  if (loading) {
+  if (loading && !product) {
     return (
       <div className="min-h-screen bg-[#FAF7F5] text-[#2C2420] font-sans">
         <Navbar />
@@ -153,23 +186,30 @@ function ProductDetailContent() {
     selectedSize: selectedSize,
   };
 
-  const handleAddToCart = () => {
+  const handleAddToCart = async () => {
     if (!product) return;
 
-    const cartItem = cart.find((item: any) => item._id === product._id && item.selectedSize === selectedSize);
-    const currentQtyInCart = cartItem ? cartItem.quantity : 0;
+    // Stock product-level hota hai: is product ki saari sizes ka cart quantity jama karo
+    const currentQtyInCart = cart
+      .filter((item: any) => item._id === product._id)
+      .reduce((sum: number, item: any) => sum + item.quantity, 0);
     const availableStock = product.stock ?? 0;
 
     if (currentQtyInCart + quantity > availableStock) {
-      toast.error(`Sorry! Only ${availableStock} items left in stock.`);
+      const remaining = Math.max(0, availableStock - currentQtyInCart);
+      toast.error(
+        remaining === 0
+          ? `Aap pehle hi saare ${availableStock} available pieces cart mein daal chuke hain.`
+          : `Sorry! Sirf ${remaining} aur item add ho sakte hain.`
+      );
       return;
     }
 
     addToCart(productForCart, quantity);
     setAdded(true);
-    router.refresh();
     toast.success(`Added ${product.title} (${selectedSize}) to cart! 🛒`);
     setTimeout(() => setAdded(false), 2500);
+    fetchProductDetails(true);
   };
 
   const categoryStr = (product.category || "").toLowerCase();
@@ -185,13 +225,15 @@ function ProductDetailContent() {
       <Navbar />
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10 flex-grow w-full">
-        <button
-          onClick={() => router.push("/products")}
-          className="inline-flex items-center space-x-2 text-xs font-semibold text-[#5E4E46] hover:text-[#8C5E73] mb-8 transition-colors cursor-pointer"
-        >
-          <ArrowLeft size={16} />
-          <span>Back to catalog</span>
-        </button>
+        <div className="flex items-center justify-between mb-8">
+          <button
+            onClick={() => router.push("/products")}
+            className="inline-flex items-center space-x-2 text-xs font-semibold text-[#5E4E46] hover:text-[#8C5E73] transition-colors cursor-pointer"
+          >
+            <ArrowLeft size={16} />
+            <span>Back to catalog</span>
+          </button>
+        </div>
 
         <div className="bg-[#EFEAE5] border border-[#E5DFDA] rounded-3xl p-6 sm:p-10 shadow-sm grid grid-cols-1 md:grid-cols-2 gap-10 items-start">
           
@@ -317,12 +359,13 @@ function ProductDetailContent() {
                 </div>
               )}
 
-              <div className={`inline-flex items-center space-x-2 text-xs font-semibold px-3.5 py-1.5 rounded-full border ${
-                isOutOfStock ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-[#F7EBEF] text-[#8C5E73] border-[#E5DFDA]'
-              }`}>
-                <ShieldCheck size={16} />
-                <span>{isOutOfStock ? "Out of Stock" : `Stock available: ${product.stock}`}</span>
-              </div>
+              {/* Only show "Out of Stock" badge when stock is 0 or less. Stock numbers are completely hidden from regular users. */}
+              {isOutOfStock && (
+                <div className="inline-flex items-center space-x-2 text-xs font-semibold px-3.5 py-1.5 rounded-full border bg-rose-50 text-rose-700 border-rose-200">
+                  <ShieldCheck size={16} />
+                  <span>Out of Stock</span>
+                </div>
+              )}
             </div>
 
             <div className="pt-6 border-t border-[#E5DFDA]">

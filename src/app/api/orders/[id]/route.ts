@@ -1,76 +1,83 @@
 import { NextResponse } from "next/server";
-import connectToDatabase from "@/lib/mongodb";
 import mongoose from "mongoose";
-import Product from "@/models/Products";
+import { getServerSession } from "next-auth";
+import dbConnect from "@/lib/mongodb";
+import { authOptions } from "@/lib/auth";
+import { restoreStock, linesFromOrderItems } from "@/lib/stock";
+import Order from "@/models/Order";
 
-// Order Schema matching your order creation route
-const OrderSchema = new mongoose.Schema({
-  userEmail: { type: String, required: true },
-  customerDetails: {
-    fullName: { type: String, required: true },
-    email: { type: String, required: true },
-    phone: { type: String, required: true },
-    city: { type: String, required: true },
-    address: { type: String, required: true },
-    paymentMethod: { type: String, required: true },
-  },
-  paymentInfo: {
-    method: { type: String, default: "cod" },
-    paymentStatus: { type: String, default: "Pending" },
-    last4: { type: String },
-  },
-  items: { type: Array, required: true },
-  couponApplied: { type: String, default: null },
-  discountAmount: { type: Number, default: 0 },
-  totalAmount: { type: Number, required: true },
-  status: { type: String, default: "Pending" },
-  createdAt: { type: Date, default: Date.now },
-});
+const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
+const ALLOWED_STATUSES = ["Pending", "Processing", "Shipped", "Delivered", "Cancelled"];
+const CANCEL_WINDOW_MINUTES = 30;
 
-const Order = mongoose.models.Order || mongoose.model("Order", OrderSchema);
-
-// Order Status Update (PUT) - Order cancel/update + Safe Stock Restoring
-export async function PUT(
-  req: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+// PUT: order cancel/update. Pehle ye route bina login ke koi bhi order cancel kar sakta tha.
+export async function PUT(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    await connectToDatabase();
-    const { id } = await params;
-    const body = await req.json();
-    const { status } = body;
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) {
+      return NextResponse.json({ success: false, error: "Unauthorized" }, { status: 401 });
+    }
 
-    // 1. Fetch existing order to check previous status
-    const existingOrder = await Order.findById(id);
+    await dbConnect();
+    const { id } = await params;
+    const { status } = await req.json();
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ success: false, error: "Invalid order ID" }, { status: 400 });
+    }
+    if (!ALLOWED_STATUSES.includes(status)) {
+      return NextResponse.json({ success: false, error: "Invalid status value" }, { status: 400 });
+    }
+
+    const existingOrder: any = await Order.findById(id);
     if (!existingOrder) {
       return NextResponse.json({ success: false, error: "Order not found" }, { status: 404 });
     }
 
-    // 2. Update order status
-    const updatedOrder = await Order.findByIdAndUpdate(
-      id,
-      { status },
-      { new: true, runValidators: true }
-    );
+    const isAdmin = session.user.email === ADMIN_EMAIL;
+    const isOwner =
+      existingOrder.userEmail === session.user.email ||
+      existingOrder.customerDetails?.email === session.user.email;
 
-    // 3. If order is newly cancelled, safely restore product stock using item._id
-    if (status === "Cancelled" && existingOrder.status !== "Cancelled") {
-      if (updatedOrder.items && Array.isArray(updatedOrder.items)) {
-        for (const item of updatedOrder.items) {
-          const productId = item._id || item.productId || item.id;
-          const qty = Number(item.quantity) || 1;
-
-          if (productId) {
-            await Product.findByIdAndUpdate(productId, {
-              $inc: { stock: qty } // Stock safely gets restored back
-            });
-          }
-        }
+    if (!isAdmin) {
+      if (!isOwner) {
+        return NextResponse.json({ success: false, error: "Forbidden" }, { status: 403 });
+      }
+      if (status !== "Cancelled") {
+        return NextResponse.json({ success: false, error: "Customers sirf order cancel kar sakte hain." }, { status: 403 });
+      }
+      if ((existingOrder.status || "Pending") !== "Pending") {
+        return NextResponse.json({ success: false, error: "Sirf Pending order cancel ho sakta hai." }, { status: 400 });
+      }
+      const ageMinutes = (Date.now() - new Date(existingOrder.createdAt).getTime()) / 60000;
+      if (ageMinutes > CANCEL_WINDOW_MINUTES) {
+        return NextResponse.json(
+          { success: false, error: `Order cancel karne ka waqt (${CANCEL_WINDOW_MINUTES} minutes) guzar chuka hai.` },
+          { status: 400 }
+        );
       }
     }
 
+    if (existingOrder.status === "Cancelled" && status !== "Cancelled") {
+      return NextResponse.json({ success: false, error: "Cancelled order dobara active nahi ho sakta." }, { status: 400 });
+    }
+
+    let updatedOrder: any;
+    if (status === "Cancelled") {
+      // Atomic: double-click / do requests se stock do baar restore nahi hoga
+      const before: any = await Order.findOneAndUpdate(
+        { _id: id, status: { $ne: "Cancelled" } },
+        { status: "Cancelled" },
+        { new: false }
+      );
+      if (before) await restoreStock(linesFromOrderItems(before.items));
+      updatedOrder = await Order.findById(id);
+    } else {
+      updatedOrder = await Order.findByIdAndUpdate(id, { status }, { new: true, runValidators: true });
+    }
+
     return NextResponse.json(
-      { success: true, message: "Order status updated and stock restored successfully", order: updatedOrder },
+      { success: true, message: "Order status updated successfully", order: updatedOrder },
       { status: 200 }
     );
   } catch (error: any) {

@@ -9,6 +9,8 @@ import { useRouter } from "next/navigation";
 import { Truck, ArrowLeft, Loader2, CheckCircle2, CreditCard, ShieldCheck, Lock, Tag, XCircle } from "lucide-react";
 import Link from "next/link";
 import axios from "axios";
+import { useLiveProducts } from "@/hooks/useLiveProducts";
+import { getEffectivePrice } from "@/lib/pricing";
 import { toast } from "sonner";
 
 export default function CheckoutPage() {
@@ -18,6 +20,8 @@ export default function CheckoutPage() {
   const router = useRouter();
 
   const [mounted, setMounted] = useState(false);
+  // DB se fresh price/stock: checkout par dikhne wala total server ke total se match karega
+  const { liveProducts, loaded: liveLoaded, refresh: refreshLive } = useLiveProducts();
   const [formData, setFormData] = useState({
     fullName: "",
     email: "",
@@ -63,7 +67,21 @@ export default function CheckoutPage() {
     }
   }, [status, router]);
 
-  const subtotal = mounted ? cart.reduce((total: number, item: any) => total + item.price * item.quantity, 0) : 0;
+  const getUnitPrice = (item: any) => {
+    const live = liveProducts[item._id];
+    return live ? getEffectivePrice(live) : item.price;
+  };
+  const getAvailableStock = (item: any) => {
+    const live = liveProducts[item._id];
+    return live ? live.stock ?? 0 : liveLoaded ? 0 : Infinity;
+  };
+  const qtyForProduct = (id: string) =>
+    cart.reduce((sum: number, i: any) => (i._id === id ? sum + i.quantity : sum), 0);
+  const stockProblemItem = mounted
+    ? cart.find((item: any) => qtyForProduct(item._id) > getAvailableStock(item))
+    : undefined;
+
+  const subtotal = mounted ? cart.reduce((total: number, item: any) => total + getUnitPrice(item) * item.quantity, 0) : 0;
   const discountAmount = appliedCoupon ? (subtotal * appliedCoupon.discountPercentage) / 100 : 0;
   const shippingFee = 0;
   const totalAmount = Math.max(0, subtotal - discountAmount + shippingFee);
@@ -117,12 +135,18 @@ export default function CheckoutPage() {
 
   const handleCheckoutSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return; // double-click se do orders na banen
     if (!session) {
       toast.error("Authentication required!");
       return;
     }
     if (cart.length === 0) {
       toast.error("Your cart is empty!");
+      return;
+    }
+
+    if (stockProblemItem) {
+      toast.error(`"${stockProblemItem.title}" ka stock kam hai ya khatam ho gaya. Cart update karein.`);
       return;
     }
 
@@ -156,12 +180,13 @@ export default function CheckoutPage() {
       if (res.status === 201) {
         setOrderPlaced(true);
         clearCart();
-        router.refresh();
         toast.success("Order placed successfully! ✨");
       }
     } catch (err: any) {
       console.error("Order submission failed:", err);
       toast.error(err.response?.data?.message || "Failed to place order. Please try again.");
+      // Stock/price change hua ho sakta hai: fresh data dobara le lo
+      refreshLive();
     } finally {
       setLoading(false);
     }
@@ -407,7 +432,7 @@ export default function CheckoutPage() {
 
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || Boolean(stockProblemItem)}
               className="w-full bg-[#8C5E73] hover:bg-[#784E60] text-white font-medium py-3.5 rounded-full shadow-md shadow-[#8C5E73]/25 transition-all text-sm flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
             >
               {loading ? (
@@ -437,7 +462,7 @@ export default function CheckoutPage() {
                   <span className="line-clamp-1 w-36">
                     {item.title} {item.selectedSize && item.selectedSize !== "Standard" ? `(${item.selectedSize})` : ""} (x{item.quantity})
                   </span>
-                  <span className="font-bold text-[#1A120E]">{convertPrice(item.price * item.quantity)}</span>
+                  <span className="font-bold text-[#1A120E]">{convertPrice(getUnitPrice(item) * item.quantity)}</span>
                 </div>
               ))}
             </div>

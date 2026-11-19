@@ -2,13 +2,14 @@ import { NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Coupon from "@/models/Coupon";
 import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
 
 const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
 
 // GET: Tamam coupons fetch karne ke liye (Admin Only)
 export async function GET() {
   try {
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || session.user?.email !== ADMIN_EMAIL) {
       return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
     }
@@ -24,7 +25,7 @@ export async function GET() {
 // POST: Naya coupon create karne ke liye (Admin Only)
 export async function POST(req: Request) {
   try {
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || session.user?.email !== ADMIN_EMAIL) {
       return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
     }
@@ -57,7 +58,7 @@ export async function POST(req: Request) {
 // DELETE: Coupon delete karne ke liye (Admin Only)
 export async function DELETE(req: Request) {
   try {
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || session.user?.email !== ADMIN_EMAIL) {
       return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
     }

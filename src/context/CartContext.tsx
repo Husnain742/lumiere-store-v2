@@ -4,44 +4,55 @@ import { createContext, useContext, useState, useEffect } from "react";
 
 const CartContext = createContext<any>(null);
 
-export function CartProvider({ children }: { children: React.ReactNode }) {
-  // Lazy initialization taake initial render par hi localStorage se cart load ho jaye
-  const [cart, setCart] = useState<any[]>(() => {
-    if (typeof window !== "undefined") {
-      const savedCart = localStorage.getItem("cart");
-      if (savedCart) {
-        try {
-          return JSON.parse(savedCart);
-        } catch (e) {
-          console.error("Failed to parse cart from localStorage", e);
-        }
-      }
-    }
-    return [];
-  });
+const CART_KEY = "cart";
 
-  // Abandoned Cart Popup State
+export function CartProvider({ children }: { children: React.ReactNode }) {
+  // FIX: pehle useState ke andar localStorage padha ja raha tha -> server HTML (empty cart) aur
+  // client HTML (saved cart) alag hote the = hydration mismatch. Ab pehle [] se start, phir mount par load.
+  const [cart, setCart] = useState<any[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [showCartReminder, setShowCartReminder] = useState(false);
 
-  // Save cart to localStorage whenever it changes & check for abandoned cart reminder
+  // 1) Mount par localStorage se cart load karo
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      localStorage.setItem("cart", JSON.stringify(cart));
-
-      // Agar cart mein items hain, aur user pehli baar wapas aaya hai toh reminder trigger karo
-      const hasShownReminder = sessionStorage.getItem("cartReminderShown");
-      if (cart.length > 0 && !hasShownReminder) {
-        // Thora sa delay de kar popup show karein taake user site par settle ho jaye
-        const timer = setTimeout(() => {
-          setShowCartReminder(true);
-          sessionStorage.setItem("cartReminderShown", "true");
-        }, 1500);
-        return () => clearTimeout(timer);
-      }
+    try {
+      const saved = localStorage.getItem(CART_KEY);
+      if (saved) setCart(JSON.parse(saved));
+    } catch (e) {
+      console.error("Failed to parse cart from localStorage", e);
     }
-  }, [cart]);
+    setHydrated(true);
+  }, []);
 
-  // Add item to cart (Updated to check both product ID and selectedSize)
+  // 2) Doosri tab mein cart badle (ya order ke baad clear ho) to yahan bhi sync ho jaye
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== CART_KEY) return;
+      try {
+        setCart(e.newValue ? JSON.parse(e.newValue) : []);
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  // 3) Cart change par save (hydrate hone se pehle save nahi karna, warna saved cart [] se overwrite ho jata)
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(CART_KEY, JSON.stringify(cart));
+
+    const hasShownReminder = sessionStorage.getItem("cartReminderShown");
+    if (cart.length > 0 && !hasShownReminder) {
+      const timer = setTimeout(() => {
+        setShowCartReminder(true);
+        sessionStorage.setItem("cartReminderShown", "true");
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [cart, hydrated]);
+
   const addToCart = (product: any, quantity = 1) => {
     setCart((prevCart) => {
       const existingIndex = prevCart.findIndex(
@@ -49,40 +60,28 @@ export function CartProvider({ children }: { children: React.ReactNode }) {
       );
       if (existingIndex > -1) {
         const updated = [...prevCart];
-        updated[existingIndex] = {
-          ...updated[existingIndex],
-          quantity: updated[existingIndex].quantity + quantity
-        };
+        const newQty = updated[existingIndex].quantity + quantity;
+        if (newQty <= 0) return prevCart.filter((_, i) => i !== existingIndex);
+        updated[existingIndex] = { ...updated[existingIndex], quantity: newQty };
         return updated;
-      } else {
-        return [...prevCart, { ...product, quantity: quantity }];
       }
+      if (quantity <= 0) return prevCart;
+      return [...prevCart, { ...product, quantity }];
     });
   };
 
-  // Remove item from cart (Updated to check both id and size if needed, or by unique identifier)
   const removeFromCart = (id: string, selectedSize?: string) => {
-    setCart((prev) => 
-      prev.filter((item) => !(item._id === id && item.selectedSize === selectedSize))
-    );
+    setCart((prev) => prev.filter((item) => !(item._id === id && item.selectedSize === selectedSize)));
   };
 
-  // Clear cart
   const clearCart = () => {
     setCart([]);
     setShowCartReminder(false);
   };
 
   return (
-    <CartContext.Provider 
-      value={{ 
-        cart, 
-        addToCart, 
-        removeFromCart, 
-        clearCart, 
-        showCartReminder, 
-        setShowCartReminder 
-      }}
+    <CartContext.Provider
+      value={{ cart, hydrated, addToCart, removeFromCart, clearCart, showCartReminder, setShowCartReminder }}
     >
       {children}
     </CartContext.Provider>

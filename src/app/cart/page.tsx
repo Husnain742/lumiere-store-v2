@@ -6,7 +6,8 @@ import { useCurrency } from "@/context/CurrencyContext";
 import { useRouter } from "next/navigation";
 import Navbar from "@/components/Navbar";
 import Link from "next/link";
-import axios from "axios";
+import { useLiveProducts } from "@/hooks/useLiveProducts";
+import { getEffectivePrice } from "@/lib/pricing";
 import { Trash2, ShoppingBag, ArrowLeft, Plus, Minus, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 
@@ -16,34 +17,36 @@ export default function CartPage() {
   const router = useRouter();
 
   const [mounted, setMounted] = useState(false);
-  const [liveStockMap, setLiveStockMap] = useState<{ [key: string]: number }>({});
+  // Database se fresh stock + price (Redis cache bypass), focus par auto-refresh
+  const { liveProducts, loaded: liveLoaded } = useLiveProducts();
 
   useEffect(() => {
     setMounted(true);
-    fetchLatestStock();
   }, []);
 
-  // Backend se fresh stock fetch karne ke liye taake stale data na rahe
-  const fetchLatestStock = async () => {
-    try {
-      const res = await axios.get("/api/products");
-      const products = res.data.products || [];
-      const stockDictionary: { [key: string]: number } = {};
-      products.forEach((p: any) => {
-        stockDictionary[p._id] = p.stock ?? 0;
-      });
-      setLiveStockMap(stockDictionary);
-    } catch (err) {
-      console.error("Failed to sync live stock in cart:", err);
-    }
+  const getLive = (item: any) => liveProducts[item._id];
+  const getUnitPrice = (item: any) => {
+    const live = getLive(item);
+    return live ? getEffectivePrice(live) : item.price;
   };
+  const getAvailableStock = (item: any) => {
+    const live = getLive(item);
+    if (live) return live.stock ?? 0;
+    return liveLoaded ? 0 : item.stock ?? 99; // loaded ho gaya magar product nahi mila = delete ho chuka
+  };
+  // Same product ki multiple sizes ka total (stock product-level hota hai)
+  const totalQtyForProduct = (id: string) =>
+    cart.reduce((sum: number, i: any) => (i._id === id ? sum + i.quantity : sum), 0);
 
   if (!mounted) return null;
 
   // Total price calculate karne ke liye
   const totalPrice = cart.reduce(
-    (total: number, item: any) => total + item.price * item.quantity,
+    (total: number, item: any) => total + getUnitPrice(item) * item.quantity,
     0
+  );
+  const hasStockIssue = cart.some(
+    (item: any) => totalQtyForProduct(item._id) > getAvailableStock(item) || getAvailableStock(item) <= 0
   );
 
   return (
@@ -67,7 +70,6 @@ export default function CartPage() {
             <button
               onClick={() => {
                 clearCart();
-                router.refresh();
                 toast.info("Cart cleared successfully");
               }}
               className="text-xs text-rose-600 hover:text-rose-700 border border-rose-200 hover:border-rose-300 bg-rose-50 px-4 py-2 rounded-full transition-all cursor-pointer font-medium"
@@ -103,13 +105,9 @@ export default function CartPage() {
                     ? item.images[0]
                     : null);
 
-                // Live stock check (agar map mein hai toh woh warna item.stock)
-                const availableStock =
-                  liveStockMap[item._id] !== undefined
-                    ? liveStockMap[item._id]
-                    : item.stock ?? 99;
-
-                const isExceedingStock = item.quantity > availableStock;
+                const availableStock = getAvailableStock(item);
+                const isExceedingStock = totalQtyForProduct(item._id) > availableStock;
+                const unitPrice = getUnitPrice(item);
 
                 return (
                   <div
@@ -143,7 +141,7 @@ export default function CartPage() {
                             Size: <span className="text-[#8C5E73]">{item.selectedSize}</span>
                           </p>
                         )}
-                        {liveStockMap[item._id] !== undefined && (
+                        {liveLoaded && (
                           <p
                             className={`text-[11px] font-semibold mt-1 flex items-center gap-1 ${
                               availableStock === 0
@@ -162,7 +160,7 @@ export default function CartPage() {
                           </p>
                         )}
                         <div className="flex items-center text-[#1A120E] font-serif font-extrabold text-sm mt-1 sm:hidden">
-                          <span>{convertPrice(item.price * item.quantity)}</span>
+                          <span>{convertPrice(unitPrice * item.quantity)}</span>
                         </div>
                       </div>
                     </div>
@@ -174,7 +172,6 @@ export default function CartPage() {
                           onClick={() => {
                             if (item.quantity > 1) {
                               addToCart(item, -1);
-                              router.refresh();
                               toast.success("Quantity updated");
                             }
                           }}
@@ -187,12 +184,11 @@ export default function CartPage() {
                         </span>
                         <button
                           onClick={() => {
-                            if (item.quantity >= availableStock) {
+                            if (totalQtyForProduct(item._id) >= availableStock) {
                               toast.error(`Sirf ${availableStock} pieces stock mein available hain!`);
                               return;
                             }
                             addToCart(item, 1);
-                            router.refresh();
                             toast.success("Quantity updated");
                           }}
                           className="p-1.5 hover:bg-[#EFEAE5] rounded-full text-[#5E4E46] transition-colors cursor-pointer"
@@ -202,13 +198,12 @@ export default function CartPage() {
                       </div>
 
                       <div className="hidden sm:flex items-center text-[#1A120E] font-serif font-extrabold text-base w-28 justify-end">
-                        <span>{convertPrice(item.price * item.quantity)}</span>
+                        <span>{convertPrice(unitPrice * item.quantity)}</span>
                       </div>
 
                       <button
                         onClick={() => {
                           removeFromCart(item._id, item.selectedSize);
-                          router.refresh();
                           toast.info("Item removed from cart");
                         }}
                         className="p-2 text-rose-600 hover:bg-rose-100/50 rounded-full transition-colors cursor-pointer"
@@ -243,11 +238,20 @@ export default function CartPage() {
                 </div>
               </div>
 
-              <Link href="/checkout">
-                <button className="w-full bg-[#8C5E73] hover:bg-[#784E60] text-white font-medium py-3.5 rounded-full shadow-md shadow-[#8C5E73]/25 transition-all text-sm cursor-pointer text-center block">
-                  Proceed to Checkout
-                </button>
-              </Link>
+              {hasStockIssue && (
+                <p className="text-[11px] text-rose-600 font-semibold mb-3 flex items-center gap-1">
+                  <AlertCircle size={12} />
+                  <span>Kuch items out of stock hain ya stock se zyada hain. Pehle cart theek karein.</span>
+                </p>
+              )}
+              <button
+                type="button"
+                disabled={hasStockIssue}
+                onClick={() => router.push("/checkout")}
+                className="w-full bg-[#8C5E73] hover:bg-[#784E60] text-white font-medium py-3.5 rounded-full shadow-md shadow-[#8C5E73]/25 transition-all text-sm cursor-pointer text-center block disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Proceed to Checkout
+              </button>
             </div>
           </div>
         )}

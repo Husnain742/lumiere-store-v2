@@ -1,76 +1,80 @@
 import { NextResponse } from "next/server";
+import mongoose from "mongoose";
+import { getServerSession } from "next-auth";
 import dbConnect from "@/lib/mongodb";
+import { authOptions } from "@/lib/auth";
 import Product from "@/models/Products";
-import { redis } from "@/lib/redis";
+import { cacheGet, cacheSet, invalidateProductCache, productKey, NO_STORE_HEADERS } from "@/lib/cache";
 
-// Single Product Fetch karne ke liye (GET with Redis Cache)
-export async function GET(
-  req: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
+
+async function requireAdmin() {
+  const session = await getServerSession(authOptions);
+  return Boolean(session && session.user?.email === ADMIN_EMAIL);
+}
+
+// GET: single product. ?fresh=1 -> cache bypass
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const cacheKey = `product_${id}`;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ success: false, error: "Product not found" }, { status: 404 });
+    }
+    const fresh = new URL(req.url).searchParams.get("fresh") === "1";
 
-    // 1. Pehle Redis Cache check karein
-    const cachedProduct = await redis.get(cacheKey);
-    if (cachedProduct) {
-      return NextResponse.json({ success: true, product: cachedProduct, source: "redis-cache" }, { status: 200 });
+    if (!fresh) {
+      const cached = await cacheGet<any>(productKey(id));
+      if (cached) {
+        const product = typeof cached === "string" ? JSON.parse(cached) : cached;
+        return NextResponse.json({ success: true, product, source: "redis-cache" }, { status: 200, headers: NO_STORE_HEADERS });
+      }
     }
 
-    // 2. Agar cache mein nahi hai, toh MongoDB se fetch karein
     await dbConnect();
-    const product = await Product.findById(id);
-
+    const product = await Product.findById(id).lean();
     if (!product) {
       return NextResponse.json({ success: false, error: "Product not found" }, { status: 404 });
     }
 
-    // 3. Product ko Redis mein save kar dein (e.g., 300 seconds / 5 mins expiry)
-    await redis.set(cacheKey, product, { ex: 300 });
-
-    return NextResponse.json({ success: true, product, source: "mongodb" }, { status: 200 });
+    await cacheSet(productKey(id), product, 300);
+    return NextResponse.json({ success: true, product, source: "mongodb" }, { status: 200, headers: NO_STORE_HEADERS });
   } catch (error: any) {
     console.error("❌ [GET SINGLE PRODUCT ERROR]:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
 
-// Product Update (Edit) karne ke liye (PUT with Cache Invalidation)
-export async function PUT(
-  req: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+// PUT: edit (admin only). Sirf wohi fields update hongi jo body mein bheji gayi hon.
+export async function PUT(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    if (!(await requireAdmin())) {
+      return NextResponse.json({ success: false, error: "Unauthorized" }, { status: 401 });
+    }
     await dbConnect();
     const { id } = await params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ success: false, error: "Product not found" }, { status: 404 });
+    }
     const body = await req.json();
 
-    const { title, price, description, discountPercentage, saleEndDate, category, image, stock } = body;
+    const update: Record<string, unknown> = {};
+    if (body.title !== undefined) update.title = body.title;
+    if (body.description !== undefined) update.description = body.description;
+    if (body.category !== undefined) update.category = body.category;
+    if (body.image !== undefined) update.image = body.image;
+    if (Array.isArray(body.images)) update.images = body.images;
+    if (Array.isArray(body.sizes)) update.sizes = body.sizes;
+    if (body.price !== undefined) update.price = Number(body.price);
+    if (body.stock !== undefined) update.stock = Math.max(0, Number(body.stock));
+    if (body.discountPercentage !== undefined) update.discountPercentage = Number(body.discountPercentage) || 0;
+    if (body.saleEndDate !== undefined) update.saleEndDate = body.saleEndDate ? new Date(body.saleEndDate) : null;
 
-    const updatedProduct = await Product.findByIdAndUpdate(
-      id,
-      { 
-        title, 
-        price: price !== undefined ? Number(price) : undefined, 
-        description, 
-        stock: stock !== undefined ? Number(stock) : undefined,
-        discountPercentage: discountPercentage !== undefined ? Number(discountPercentage) : 0,
-        saleEndDate: saleEndDate ? new Date(saleEndDate) : null,
-        category,
-        image
-      },
-      { new: true, runValidators: true }
-    );
-
+    const updatedProduct = await Product.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });
     if (!updatedProduct) {
       return NextResponse.json({ success: false, error: "Product not found" }, { status: 404 });
     }
 
-    // 4. Purana cache clear kar dein (both single product and main products list)
-    await redis.del(`product_${id}`);
-    await redis.del("all_products");
-
+    await invalidateProductCache([id]);
     return NextResponse.json({ success: true, message: "Product updated successfully", product: updatedProduct }, { status: 200 });
   } catch (error: any) {
     console.error("❌ [UPDATE PRODUCT ERROR]:", error);
@@ -78,24 +82,22 @@ export async function PUT(
   }
 }
 
-// Product Delete karne ke liye (DELETE with Cache Invalidation)
-export async function DELETE(
-  req: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+// DELETE (admin only)
+export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    if (!(await requireAdmin())) {
+      return NextResponse.json({ success: false, error: "Unauthorized" }, { status: 401 });
+    }
     await dbConnect();
     const { id } = await params;
-
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ success: false, error: "Product not found" }, { status: 404 });
+    }
     const deletedProduct = await Product.findByIdAndDelete(id);
     if (!deletedProduct) {
       return NextResponse.json({ success: false, error: "Product not found" }, { status: 404 });
     }
-
-    // 5. Delete hone par bhi cache clear kar dein
-    await redis.del(`product_${id}`);
-    await redis.del("all_products");
-
+    await invalidateProductCache([id]);
     return NextResponse.json({ success: true, message: "Product deleted successfully" }, { status: 200 });
   } catch (error: any) {
     console.error("❌ [DELETE PRODUCT ERROR]:", error);

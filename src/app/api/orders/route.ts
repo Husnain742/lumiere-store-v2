@@ -2,210 +2,163 @@ import { NextResponse } from "next/server";
 import mongoose from "mongoose";
 import axios from "axios";
 import { getServerSession } from "next-auth";
-import { ratelimit } from "@/lib/ratelimit";
+import dbConnect from "@/lib/mongodb";
+import { authOptions } from "@/lib/auth";
+import { orderRatelimit, getClientIp, safeLimit } from "@/lib/ratelimit";
+import { getEffectivePrice } from "@/lib/pricing";
+import { reserveStock, restoreStock, linesFromOrderItems, StockError, StockLine } from "@/lib/stock";
+import { invalidateProductCache, NO_STORE_HEADERS } from "@/lib/cache";
+import Product from "@/models/Products";
+import Coupon from "@/models/Coupon";
+import Order from "@/models/Order";
 
-const MONGODB_URI = process.env.MONGODB_URI;
 const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
+const ALLOWED_STATUSES = ["Pending", "Processing", "Shipped", "Delivered", "Cancelled"];
 
-async function connectDB() {
-  if (mongoose.connection.readyState === 1) {
-    return;
-  }
-  if (!MONGODB_URI) {
-    throw new Error("Please define the MONGODB_URI environment variable");
-  }
-  await mongoose.connect(MONGODB_URI, { bufferCommands: false });
-}
-
-// Product Reference Schema
-const ProductSchema = new mongoose.Schema({
-  title: String,
-  price: Number,
-  stock: Number,
-  images: [String],
-  image: String,
-  discountPercentage: Number,
-  saleEndDate: Date,
-}, { strict: false });
-
-if (mongoose.models.Product) {
-  delete mongoose.models.Product;
-}
-const Product = mongoose.model("Product", ProductSchema);
-
-// Coupon Schema
-const CouponSchema = new mongoose.Schema({
-  code: String,
-  discountPercentage: Number,
-  expiryDate: Date,
-  isActive: Boolean,
-});
-
-if (mongoose.models.Coupon) {
-  delete mongoose.models.Coupon;
-}
-const Coupon = mongoose.model("Coupon", CouponSchema);
-
-// Order Schema
-const OrderSchema = new mongoose.Schema({
-  userEmail: { type: String, required: true },
-  customerDetails: {
-    fullName: { type: String, required: true },
-    email: { type: String, required: true },
-    phone: { type: String, required: true },
-    city: { type: String, required: true },
-    address: { type: String, required: true },
-    paymentMethod: { type: String, required: true },
-  },
-  paymentInfo: {
-    method: { type: String, default: "cod" },
-    paymentStatus: { type: String, default: "Pending" },
-    last4: { type: String },
-  },
-  items: { type: Array, required: true },
-  couponApplied: { type: String, default: null },
-  discountAmount: { type: Number, default: 0 },
-  totalAmount: { type: Number, required: true },
-  status: { type: String, default: "Pending" },
-  createdAt: { type: Date, default: Date.now },
-});
-
-if (mongoose.models.Order) {
-  delete mongoose.models.Order;
-}
-const Order = mongoose.model("Order", OrderSchema);
-
-// Helper function to format WhatsApp numbers for UltraMsg
 function formatWhatsAppNumber(phone: string): string {
   if (!phone) return "";
   let cleaned = phone.trim().replace(/[\s\-\+\(\)]/g, "");
-  if (cleaned.startsWith("0")) {
-    cleaned = "92" + cleaned.slice(1);
-  } else if (cleaned.length === 10 && cleaned.startsWith("3")) {
-    cleaned = "92" + cleaned;
-  }
+  if (cleaned.startsWith("0")) cleaned = "92" + cleaned.slice(1);
+  else if (cleaned.length === 10 && cleaned.startsWith("3")) cleaned = "92" + cleaned;
   return cleaned;
 }
 
-// Helper function to send WhatsApp notifications via UltraMsg
 async function sendWhatsAppNotification(phone: string, message: string) {
   try {
     const instanceId = process.env.WHATSAPP_INSTANCE_ID;
     const token = process.env.WHATSAPP_TOKEN;
-
     if (!instanceId || !token) {
       console.warn("WhatsApp credentials missing in .env");
       return;
     }
-
-    const formattedPhone = formatWhatsAppNumber(phone);
     const url = `https://api.ultramsg.com/${instanceId}/messages/chat`;
-
-    const response = await axios.post(url, {
-      token: token,
-      to: formattedPhone,
-      body: message,
-    });
-
-    console.log("✅ UltraMsg WhatsApp message sent successfully:", response.data);
+    const response = await axios.post(url, { token, to: formatWhatsAppNumber(phone), body: message });
+    console.log("✅ UltraMsg WhatsApp message sent:", response.data);
   } catch (error: any) {
     console.error("❌ UltraMsg notification failed:", error?.response?.data || error?.message || error);
   }
 }
 
-// POST: Order Creation (Stock instantly decreases here)
+// ---------------------------------------------------------------------------
+// POST: order create + stock decrease (atomic)
+// ---------------------------------------------------------------------------
 export async function POST(req: Request) {
+  let reservedLines: StockLine[] = [];
   try {
-    const ip = req.headers.get("x-forwarded-for") ?? "127.0.0.1";
-    const { success, limit, reset, remaining } = await ratelimit.limit(ip);
-
+    const { success } = await safeLimit(orderRatelimit, getClientIp(req));
     if (!success) {
       return NextResponse.json(
-        { message: "Bohat ziyaada order requests aa gayi hain. Baraye meharbaani kuch der baad koshish karein." }, 
+        { message: "Bohat ziyaada order requests aa gayi hain. Baraye meharbaani kuch der baad koshish karein." },
         { status: 429 }
       );
     }
 
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || !session.user?.email) {
       return NextResponse.json({ message: "Unauthorized: Please sign in to place an order." }, { status: 401 });
     }
 
-    await connectDB();
+    await dbConnect();
     const body = await req.json();
-    const { customerDetails, items, paymentInfo, couponCode } = body;
+    const { customerDetails, items, couponCode } = body ?? {};
 
-    if (!customerDetails || !items || !Array.isArray(items) || items.length === 0) {
+    if (!customerDetails || !Array.isArray(items) || items.length === 0) {
       return NextResponse.json({ message: "Invalid order data or empty cart" }, { status: 400 });
     }
 
-    let subtotal = 0;
-    const verifiedItems = [];
-
+    // 1) Cart lines validate karo
+    const cartLines: { id: string; quantity: number; selectedSize: string }[] = [];
     for (const item of items) {
-      const quantity = Number(item.quantity);
-      const prodId = item._id || item.productId;
-      
-      if (!prodId || isNaN(quantity) || quantity <= 0) {
+      const quantity = Math.floor(Number(item?.quantity));
+      const prodId = String(item?._id || item?.productId || item?.id || "");
+      if (!prodId || !Number.isFinite(quantity) || quantity <= 0) {
         return NextResponse.json({ message: "Invalid item quantity or product ID detected." }, { status: 400 });
       }
-
-      // Safe query with MongoDB ObjectId validation
-      const dbProduct = await Product.findById(prodId);
-      if (!dbProduct) {
-        console.error(`❌ Product not found for ID: ${prodId}`);
-        return NextResponse.json({ message: `Product not found: ${prodId}` }, { status: 404 });
+      if (!mongoose.Types.ObjectId.isValid(prodId)) {
+        return NextResponse.json({ message: `Invalid Product ID format: ${prodId}` }, { status: 400 });
       }
-
-      if ((dbProduct.stock ?? 0) < quantity) {
-        return NextResponse.json({ message: `Insufficient stock for "${dbProduct.title}". Available: ${dbProduct.stock}` }, { status: 400 });
-      }
-
-      const isSaleActive = dbProduct.saleEndDate ? new Date().getTime() < new Date(dbProduct.saleEndDate).getTime() : false;
-      const hasDiscount = Boolean(dbProduct.discountPercentage && dbProduct.discountPercentage > 0 && isSaleActive);
-      const originalPrice = Number(dbProduct.price);
-      const effectivePrice = hasDiscount ? originalPrice - (originalPrice * dbProduct.discountPercentage) / 100 : originalPrice;
-
-      subtotal += effectivePrice * quantity;
-      verifiedItems.push({
-        _id: dbProduct._id,
-        title: dbProduct.title,
-        price: effectivePrice,
-        originalPrice: originalPrice,
-        quantity: quantity,
-        image: dbProduct.images?.[0] || dbProduct.image || "",
-      });
+      cartLines.push({ id: prodId, quantity, selectedSize: String(item?.selectedSize || "Standard") });
     }
 
-    let discountAmount = 0;
-    let appliedCouponName = null;
+    // 2) Products DB se fresh lo (cache se nahi)
+    const uniqueIds = [...new Set(cartLines.map((l) => l.id))];
+    const dbProducts = await Product.find({ _id: { $in: uniqueIds } }).lean();
+    const productMap = new Map(dbProducts.map((p: any) => [String(p._id), p]));
 
+    // 3) Same product ki multiple sizes ko merge karke total stock check karo
+    const totalQtyByProduct = new Map<string, number>();
+    for (const line of cartLines) {
+      totalQtyByProduct.set(line.id, (totalQtyByProduct.get(line.id) || 0) + line.quantity);
+    }
+    for (const [id, qty] of totalQtyByProduct) {
+      const p: any = productMap.get(id);
+      if (!p) return NextResponse.json({ message: `Product not found: ${id}` }, { status: 404 });
+      if ((Number(p.stock) || 0) < qty) {
+        return NextResponse.json(
+          { message: `Insufficient stock for "${p.title}". Available: ${Number(p.stock) || 0}` },
+          { status: 409 }
+        );
+      }
+    }
+
+    // 4) Server-side price calculation (client ki price par bharosa nahi)
+    let subtotal = 0;
+    const verifiedItems = cartLines.map((line) => {
+      const p: any = productMap.get(line.id);
+      const effectivePrice = getEffectivePrice(p);
+      subtotal += effectivePrice * line.quantity;
+      return {
+        _id: p._id,
+        title: p.title,
+        price: effectivePrice,
+        originalPrice: Number(p.price),
+        quantity: line.quantity,
+        selectedSize: line.selectedSize,
+        image: p.images?.[0] || p.image || "",
+      };
+    });
+
+    let discountAmount = 0;
+    let appliedCouponName: string | null = null;
     if (couponCode) {
-      const validCoupon = await Coupon.findOne({ code: couponCode.toUpperCase().trim(), isActive: true });
+      const validCoupon: any = await Coupon.findOne({
+        code: String(couponCode).toUpperCase().trim(),
+        isActive: true,
+      }).lean();
       if (validCoupon && new Date() <= new Date(validCoupon.expiryDate)) {
         discountAmount = (subtotal * validCoupon.discountPercentage) / 100;
         appliedCouponName = validCoupon.code;
       }
     }
-
     const finalTotalAmount = Math.max(0, subtotal - discountAmount);
 
-    // INSTANT STOCK DECREASE WHEN ORDER IS PLACED
-    for (const vItem of verifiedItems) {
-      const updateResult = await Product.findByIdAndUpdate(vItem._id, {
-        $inc: { stock: -vItem.quantity },
-      });
-      console.log(`📦 Stock updated for product ${vItem.title}: -${vItem.quantity}`, updateResult);
-    }
+    // 5) STOCK DECREASE: atomic $inc (condition: stock >= qty)
+    const stockLines: StockLine[] = [...totalQtyByProduct].map(([id, qty]) => ({
+      productId: id,
+      quantity: qty,
+      title: (productMap.get(id) as any)?.title,
+    }));
+    const { reserved, newStock } = await reserveStock(stockLines);
+    reservedLines = reserved;
 
+    // 6) Order save. Fail ho to stock wapas (catch block mein)
     const isCard = customerDetails.paymentMethod === "card";
+    const safeCustomer = {
+      fullName: String(customerDetails.fullName ?? "").trim(),
+      email: String(customerDetails.email ?? "").trim(),
+      phone: String(customerDetails.phone ?? "").trim(),
+      city: String(customerDetails.city ?? "").trim(),
+      address: String(customerDetails.address ?? "").trim(),
+      paymentMethod: isCard ? "card" : "cod",
+    };
+
     const newOrder = await Order.create({
       userEmail: session.user.email,
-      customerDetails,
+      customerDetails: safeCustomer,
       paymentInfo: {
         method: isCard ? "card" : "cod",
         paymentStatus: isCard ? "Paid" : "Pending",
-        last4: isCard && paymentInfo?.last4 ? String(paymentInfo.last4).slice(-4) : undefined,
+        last4: isCard && body?.paymentInfo?.last4 ? String(body.paymentInfo.last4).slice(-4) : undefined,
       },
       items: verifiedItems,
       couponApplied: appliedCouponName,
@@ -213,98 +166,110 @@ export async function POST(req: Request) {
       totalAmount: Number(finalTotalAmount.toFixed(2)),
       status: "Pending",
     });
+    reservedLines = []; // order save ho gaya, rollback ki zaroorat nahi
 
-    if (customerDetails.phone) {
+    if (safeCustomer.phone) {
       const orderShortId = newOrder._id.toString().slice(-6).toUpperCase();
       const paymentText = isCard ? "Paid via Card" : "Cash on Delivery";
-      const message = `Hello ${customerDetails.fullName}! ✨ Aapka Lumière store par order #${orderShortId} (${paymentText}) successfully place ho gaya hai. Total Amount: Rs. ${finalTotalAmount.toLocaleString()}. Shukriya!`;
-
-      sendWhatsAppNotification(customerDetails.phone, message).catch((err) =>
+      const message = `Hello ${safeCustomer.fullName}! ✨ Aapka Lumière store par order #${orderShortId} (${paymentText}) successfully place ho gaya hai. Total Amount: Rs. ${finalTotalAmount.toLocaleString()}. Shukriya!`;
+      sendWhatsAppNotification(safeCustomer.phone, message).catch((err) =>
         console.error("Background WhatsApp Error:", err)
       );
     }
 
-    return NextResponse.json({ message: "Order placed successfully", orderId: newOrder._id }, { status: 201 });
+    return NextResponse.json(
+      { message: "Order placed successfully", orderId: newOrder._id, totalAmount: newOrder.totalAmount, newStock },
+      { status: 201, headers: NO_STORE_HEADERS }
+    );
   } catch (error: any) {
+    // Order save fail hua magar stock minus ho chuka tha -> wapas karo
+    if (reservedLines.length > 0) {
+      await restoreStock(reservedLines);
+    }
+    if (error instanceof StockError) {
+      return NextResponse.json({ message: error.message }, { status: 409 });
+    }
+    if (error?.name === "ValidationError") {
+      return NextResponse.json({ message: "Please fill all shipping details correctly.", error: error.message }, { status: 400 });
+    }
     console.error("❌ Error saving order / decreasing stock:", error);
     return NextResponse.json({ message: "Internal Server Error", error: error.message }, { status: 500 });
   }
 }
 
-// GET: Secure Order Fetching
-export async function GET(req: Request) {
+// ---------------------------------------------------------------------------
+// GET: user ke apne orders (admin ko sab)
+// ---------------------------------------------------------------------------
+export async function GET() {
   try {
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || !session.user?.email) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 });
     }
-
-    await connectDB();
+    await dbConnect();
     const isAdmin = session.user.email === ADMIN_EMAIL;
-
     const query = isAdmin
       ? {}
-      : {
-          $or: [
-            { userEmail: session.user.email },
-            { "customerDetails.email": session.user.email },
-          ],
-        };
+      : { $or: [{ userEmail: session.user.email }, { "customerDetails.email": session.user.email }] };
 
     const orders = await Order.find(query).sort({ createdAt: -1 });
-    return NextResponse.json({ orders }, { status: 200 });
+    return NextResponse.json({ orders }, { status: 200, headers: NO_STORE_HEADERS });
   } catch (error: any) {
     console.error("Error fetching orders:", error);
     return NextResponse.json({ message: "Failed to fetch orders", error: error.message }, { status: 500 });
   }
 }
 
-// PATCH: Admin Status Update (Handles Admin changes cleanly without messing with stock)
+// ---------------------------------------------------------------------------
+// PATCH: admin status update (cancel par stock restore, sirf ek baar)
+// ---------------------------------------------------------------------------
 export async function PATCH(req: Request) {
   try {
-    const session = await getServerSession();
+    const session = await getServerSession(authOptions);
     if (!session || session.user?.email !== ADMIN_EMAIL) {
       return NextResponse.json({ message: "Forbidden: Admin only." }, { status: 403 });
     }
-
-    await connectDB();
-    const body = await req.json();
-    const { orderId, status } = body;
+    await dbConnect();
+    const { orderId, status } = await req.json();
 
     if (!orderId || !status) {
       return NextResponse.json({ message: "Order ID and status are required" }, { status: 400 });
     }
-
-    const existingOrder = await Order.findById(orderId);
-    if (!existingOrder) {
-      return NextResponse.json({ message: "Order not found" }, { status: 404 });
+    if (!ALLOWED_STATUSES.includes(status)) {
+      return NextResponse.json({ message: "Invalid status value" }, { status: 400 });
+    }
+    if (!mongoose.Types.ObjectId.isValid(orderId)) {
+      return NextResponse.json({ message: "Invalid order ID" }, { status: 400 });
     }
 
-    // If admin explicitly cancels an order from dashboard, restore stock back
-    if (status === "Cancelled" && existingOrder.status !== "Cancelled") {
-      if (existingOrder.items && Array.isArray(existingOrder.items)) {
-        for (const item of existingOrder.items) {
-          const productId = item._id || item.productId;
-          const qty = Number(item.quantity) || 1;
-          if (productId) {
-            await Product.findByIdAndUpdate(productId, {
-              $inc: { stock: qty }
-            });
-            console.log(`🔄 Stock restored for cancelled order item ${productId}: +${qty}`);
-          }
-        }
-      }
+    const existingOrder: any = await Order.findById(orderId);
+    if (!existingOrder) return NextResponse.json({ message: "Order not found" }, { status: 404 });
+
+    if (existingOrder.status === "Cancelled" && status !== "Cancelled") {
+      return NextResponse.json(
+        { message: "Cancelled order dobara active nahi ho sakta (stock pehle hi wapas ja chuka hai). Naya order banwayen." },
+        { status: 400 }
+      );
     }
 
-    const updatedOrder = await Order.findByIdAndUpdate(orderId, { status }, { new: true });
+    let updatedOrder: any;
+    if (status === "Cancelled") {
+      // Atomic: sirf wohi request stock restore karegi jo status ko pehli baar Cancelled karti hai
+      const before: any = await Order.findOneAndUpdate(
+        { _id: orderId, status: { $ne: "Cancelled" } },
+        { status: "Cancelled" },
+        { new: false }
+      );
+      if (before) await restoreStock(linesFromOrderItems(before.items));
+      updatedOrder = await Order.findById(orderId);
+    } else {
+      updatedOrder = await Order.findByIdAndUpdate(orderId, { status }, { new: true });
+    }
 
-    const customerPhone = updatedOrder.customerDetails?.phone;
-    const customerName = updatedOrder.customerDetails?.fullName || "Customer";
-
+    const customerPhone = updatedOrder?.customerDetails?.phone;
     if (customerPhone) {
       const orderShortId = updatedOrder._id.toString().slice(-6).toUpperCase();
-      const message = `Hello ${customerName}! 📦 Aapka Lumière store ka order #${orderShortId} ka status update ho kar *${status}* ho gaya hai. Shukriya! ✨`;
-
+      const message = `Hello ${updatedOrder.customerDetails?.fullName || "Customer"}! 📦 Aapka Lumière store ka order #${orderShortId} ka status update ho kar *${status}* ho gaya hai. Shukriya! ✨`;
       sendWhatsAppNotification(customerPhone, message).catch((err) =>
         console.error("Background Status WhatsApp Error:", err)
       );
